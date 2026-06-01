@@ -107,6 +107,7 @@ struct epollop {
 	epoll_handle epfd;
 #ifdef USING_TIMERFD
 	int timerfd;
+	struct itimerspec last_timerfd_set; /* cached last value set; skip syscall when unchanged */
 #endif
 };
 
@@ -486,12 +487,15 @@ epoll_dispatch(struct event_base *base, struct timeval *tv)
 			is.it_value.tv_sec = tv->tv_sec;
 			is.it_value.tv_nsec = tv->tv_usec * 1000;
 		}
-		/* TODO: we could avoid unnecessary syscalls here by only
-		   calling timerfd_settime when the top timeout changes, or
-		   when we're called with a different timeval.
-		*/
-		if (timerfd_settime(epollop->timerfd, 0, &is, NULL) < 0) {
-			event_warn("timerfd_settime");
+		/* Skip timerfd_settime when the disarmed state is already set;
+		 * avoids a syscall per dispatch on workloads with no timer events. */
+		if (is.it_value.tv_sec != 0 || is.it_value.tv_nsec != 0 ||
+		    epollop->last_timerfd_set.it_value.tv_sec != 0 ||
+		    epollop->last_timerfd_set.it_value.tv_nsec != 0) {
+			if (timerfd_settime(epollop->timerfd, 0, &is, NULL) < 0) {
+				event_warn("timerfd_settime");
+			}
+			epollop->last_timerfd_set = is;
 		}
 	} else
 #endif
