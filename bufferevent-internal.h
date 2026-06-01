@@ -185,6 +185,14 @@ struct bufferevent_private {
 	 * data-arrival signal. Cleared when the final CQE (without
 	 * IORING_CQE_F_MORE) is observed by the recv completion callback. */
 	unsigned uring_recv_multishot : 1;
+	/** Flag: set while the io_uring multishot read-inactivity timeout
+	 * timer (uring_read_timeout_ev) is armed. */
+	unsigned uring_read_timeout_active : 1;
+	/** Inactivity timer for the io_uring multishot read path. That path
+	 * keeps ev_read out of epoll, so it cannot use ev_read's EV_TIMEOUT;
+	 * this fires the read timeout instead. Armed only when a read
+	 * timeout is configured; reset on each data CQE. */
+	struct event uring_read_timeout_ev;
 	/** Set to the events pending if we have deferred callbacks and
 	 * an events callback is pending. */
 	short eventcb_pending;

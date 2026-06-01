@@ -273,6 +273,126 @@ test_io_uring_roundtrip_large(void *arg)
 	roundtrip_with_payload(64 * 1024);
 }
 
+/* The multishot read path keeps ev_read out of epoll, so the read
+ * inactivity timeout must be enforced by the io_uring path itself. The
+ * writer never sends; the reader's 200ms read timeout must still fire. */
+struct uring_timeout_state {
+	struct event_base *base;
+	short got;
+};
+static void
+uring_timeout_event_cb(struct bufferevent *bev, short what, void *arg)
+{
+	struct uring_timeout_state *st = arg;
+	(void)bev;
+	st->got |= what;
+	if (what & BEV_EVENT_TIMEOUT)
+		event_base_loopexit(st->base, NULL);
+}
+static void
+test_io_uring_read_timeout(void *arg)
+{
+	struct event_base *base = NULL;
+	struct bufferevent *reader = NULL, *writer = NULL;
+	evutil_socket_t sv[2] = { -1, -1 };
+	struct uring_timeout_state st;
+	struct timeval rd_to = { 0, 200 * 1000 };
+	struct timeval cap = { 2, 0 };
+
+	(void)arg;
+	memset(&st, 0, sizeof(st));
+
+	base = make_uring_base(0);
+	tt_assert(base != NULL);
+	SKIP_IF_NO_URING(base);
+
+	tt_assert(evutil_socketpair(AF_UNIX,
+	    SOCK_STREAM | EVUTIL_SOCK_NONBLOCK, 0, sv) == 0);
+	reader = bufferevent_socket_new(base, sv[0], BEV_OPT_CLOSE_ON_FREE);
+	writer = bufferevent_socket_new(base, sv[1], BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(reader != NULL);
+	tt_assert(writer != NULL);
+	sv[0] = sv[1] = -1;
+
+	st.base = base;
+	bufferevent_setcb(reader, NULL, NULL, uring_timeout_event_cb, &st);
+	tt_assert(bufferevent_set_timeouts(reader, &rd_to, NULL) == 0);
+	tt_assert(bufferevent_enable(reader, EV_READ) == 0);
+
+	/* Writer is silent. Watchdog (2s) ends the loop if the timeout
+	 * never fires -- which is exactly the bug this guards against. */
+	event_base_loopexit(base, &cap);
+	event_base_dispatch(base);
+
+	tt_assert(st.got & BEV_EVENT_TIMEOUT);
+	tt_assert(st.got & BEV_EVENT_READING);
+
+end:
+	if (reader)
+		bufferevent_free(reader);
+	if (writer)
+		bufferevent_free(writer);
+	if (sv[0] >= 0)
+		evutil_closesocket(sv[0]);
+	if (sv[1] >= 0)
+		evutil_closesocket(sv[1]);
+	if (base)
+		event_base_free(base);
+}
+
+/* Same as read_timeout, but the timeout is set AFTER EV_READ is enabled,
+ * i.e. while the multishot is already in flight. Exercises the
+ * be_socket_adj_timeouts_ re-arm path. */
+static void
+test_io_uring_read_timeout_after_enable(void *arg)
+{
+	struct event_base *base = NULL;
+	struct bufferevent *reader = NULL, *writer = NULL;
+	evutil_socket_t sv[2] = { -1, -1 };
+	struct uring_timeout_state st;
+	struct timeval rd_to = { 0, 200 * 1000 };
+	struct timeval cap = { 2, 0 };
+
+	(void)arg;
+	memset(&st, 0, sizeof(st));
+
+	base = make_uring_base(0);
+	tt_assert(base != NULL);
+	SKIP_IF_NO_URING(base);
+
+	tt_assert(evutil_socketpair(AF_UNIX,
+	    SOCK_STREAM | EVUTIL_SOCK_NONBLOCK, 0, sv) == 0);
+	reader = bufferevent_socket_new(base, sv[0], BEV_OPT_CLOSE_ON_FREE);
+	writer = bufferevent_socket_new(base, sv[1], BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(reader != NULL);
+	tt_assert(writer != NULL);
+	sv[0] = sv[1] = -1;
+
+	st.base = base;
+	bufferevent_setcb(reader, NULL, NULL, uring_timeout_event_cb, &st);
+	/* Enable first (arms the multishot with no timeout), THEN set it. */
+	tt_assert(bufferevent_enable(reader, EV_READ) == 0);
+	tt_assert(bufferevent_set_timeouts(reader, &rd_to, NULL) == 0);
+
+	event_base_loopexit(base, &cap);
+	event_base_dispatch(base);
+
+	tt_assert(st.got & BEV_EVENT_TIMEOUT);
+	tt_assert(st.got & BEV_EVENT_READING);
+
+end:
+	if (reader)
+		bufferevent_free(reader);
+	if (writer)
+		bufferevent_free(writer);
+	if (sv[0] >= 0)
+		evutil_closesocket(sv[0]);
+	if (sv[1] >= 0)
+		evutil_closesocket(sv[1]);
+	if (base)
+		event_base_free(base);
+}
+
 /* Tests run without basic_setup since each test creates its own base with
  * the io_uring flag set. */
 struct testcase_t io_uring_testcases[] = {
@@ -284,6 +404,9 @@ struct testcase_t io_uring_testcases[] = {
 	  NULL, NULL },
 	{ "roundtrip_large", test_io_uring_roundtrip_large, TT_FORK,
 	  NULL, NULL },
+	{ "read_timeout", test_io_uring_read_timeout, TT_FORK, NULL, NULL },
+	{ "read_timeout_after_enable", test_io_uring_read_timeout_after_enable,
+	  TT_FORK, NULL, NULL },
 	END_OF_TESTCASES
 };
 

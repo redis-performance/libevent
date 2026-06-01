@@ -101,6 +101,10 @@ static int be_socket_uring_submit_recv_multishot_(struct bufferevent *bufev,
     evutil_socket_t fd);
 static int be_socket_uring_cancel_recv_(struct bufferevent *bufev,
     evutil_socket_t fd);
+static void be_socket_uring_read_timeout_cb_(evutil_socket_t, short, void *);
+static void be_socket_uring_read_timeout_update_(struct bufferevent *bufev);
+static void be_socket_uring_read_timeout_clear_(struct bufferevent *bufev);
+static int be_socket_adj_timeouts_(struct bufferevent *bufev);
 
 const struct bufferevent_ops bufferevent_ops_socket = {
 	"socket",
@@ -109,7 +113,7 @@ const struct bufferevent_ops bufferevent_ops_socket = {
 	be_socket_disable,
 	NULL, /* unlink */
 	be_socket_destruct,
-	bufferevent_generic_adj_existing_timeouts_,
+	be_socket_adj_timeouts_,
 	be_socket_flush,
 	be_socket_ctrl,
 };
@@ -657,6 +661,7 @@ be_socket_disable(struct bufferevent *bufev, short event)
 			 * final CQE (F_MORE clear) and clear the flag. */
 			evutil_socket_t fd = event_get_fd(&bufev->ev_read);
 			(void)be_socket_uring_cancel_recv_(bufev, fd);
+			be_socket_uring_read_timeout_clear_(bufev);
 		} else if (event_del(&bufev->ev_read) == -1) {
 			return -1;
 		}
@@ -675,6 +680,8 @@ be_socket_destruct(struct bufferevent *bufev)
 	struct bufferevent_private *bufev_p = BEV_UPCAST(bufev);
 	evutil_socket_t fd;
 	EVUTIL_ASSERT(BEV_IS_SOCKET(bufev));
+
+	be_socket_uring_read_timeout_clear_(bufev);
 
 	fd = event_get_fd(&bufev->ev_read);
 
@@ -1060,6 +1067,65 @@ be_socket_uring_submit_write_(struct bufferevent *bufev,
 	return 0;
 }
 
+static void
+be_socket_uring_read_timeout_update_(struct bufferevent *bufev)
+{
+	struct bufferevent_private *bufev_p = BEV_UPCAST(bufev);
+	if (evutil_timerisset(&bufev->timeout_read)) {
+		event_add(&bufev_p->uring_read_timeout_ev, &bufev->timeout_read);
+		bufev_p->uring_read_timeout_active = 1;
+	}
+}
+
+static void
+be_socket_uring_read_timeout_clear_(struct bufferevent *bufev)
+{
+	struct bufferevent_private *bufev_p = BEV_UPCAST(bufev);
+	if (bufev_p->uring_read_timeout_active) {
+		event_del(&bufev_p->uring_read_timeout_ev);
+		bufev_p->uring_read_timeout_active = 0;
+	}
+}
+
+static void
+be_socket_uring_read_timeout_cb_(evutil_socket_t fd, short what, void *arg)
+{
+	struct bufferevent *bufev = arg;
+	struct bufferevent_private *bufev_p = BEV_UPCAST(bufev);
+	evutil_socket_t sfd;
+	(void)fd;
+	(void)what;
+
+	bufferevent_incref_and_lock_(bufev);
+	bufev_p->uring_read_timeout_active = 0;
+	/* Inactivity timeout on the multishot read path: stop the multishot
+	 * and surface a read timeout, matching the epoll path. */
+	sfd = event_get_fd(&bufev->ev_read);
+	if (bufev_p->uring_recv_multishot && sfd >= 0)
+		(void)be_socket_uring_cancel_recv_(bufev, sfd);
+	bufferevent_run_eventcb_(bufev, BEV_EVENT_READING | BEV_EVENT_TIMEOUT, 0);
+	bufferevent_decref_and_unlock_(bufev);
+}
+
+/* The multishot read path keeps ev_read out of epoll, so the generic
+ * timeout adjuster -- which only touches ev_read/ev_write EV_TIMEOUT --
+ * cannot see our read timeout. When a multishot is in flight, re-arm or
+ * clear uring_read_timeout_ev from the (possibly just-changed) timeout_read
+ * so bufferevent_set_timeouts() takes effect on a live connection. */
+static int
+be_socket_adj_timeouts_(struct bufferevent *bufev)
+{
+	struct bufferevent_private *bufev_p = BEV_UPCAST(bufev);
+	int r = bufferevent_generic_adj_existing_timeouts_(bufev);
+	if (bufev_p->uring_recv_multishot) {
+		if (evutil_timerisset(&bufev->timeout_read))
+			be_socket_uring_read_timeout_update_(bufev);
+		else
+			be_socket_uring_read_timeout_clear_(bufev);
+	}
+	return r;
+}
+
 /* ----------------------------------------------------------------------
  * Multishot recv fast path.
  *
@@ -1128,8 +1194,11 @@ be_socket_uring_recv_cb_(int result, unsigned cqe_flags, void *arg)
 		}
 	}
 
-	if (trigger_user)
+	if (trigger_user) {
 		bufferevent_trigger_nolock_(bufev, EV_READ, 0);
+		/* Data arrived: reset the read inactivity timeout. */
+		be_socket_uring_read_timeout_update_(bufev);
+	}
 
 	if (what & (BEV_EVENT_ERROR | BEV_EVENT_EOF)) {
 		bufferevent_disable(bufev, EV_READ);
@@ -1147,6 +1216,7 @@ be_socket_uring_recv_cb_(int result, unsigned cqe_flags, void *arg)
 	 * disabling or tearing down), fall back to the epoll-driven path
 	 * for any other end-of-multishot (e.g. ENOBUFS). */
 	bufev_p->uring_recv_multishot = 0;
+	be_socket_uring_read_timeout_clear_(bufev);
 	if ((bufev->enabled & EV_READ) &&
 	    !(what & (BEV_EVENT_ERROR | BEV_EVENT_EOF)) &&
 	    !(result == -ECANCELED)) {
@@ -1176,6 +1246,14 @@ be_socket_uring_submit_recv_multishot_(struct bufferevent *bufev,
 		return -1;
 	}
 	bufev_p->uring_recv_multishot = 1;
+	/* Arm the read inactivity timeout. The event is assigned here even
+	 * when no timeout is set yet, so a later bufferevent_set_timeouts()
+	 * (routed through be_socket_adj_timeouts_) can add it. Arming is a
+	 * no-op without a configured timeout, so the throughput path is
+	 * unaffected. */
+	event_assign(&bufev_p->uring_read_timeout_ev, bufev->ev_base, -1, 0,
+	    be_socket_uring_read_timeout_cb_, bufev);
+	be_socket_uring_read_timeout_update_(bufev);
 	return 0;
 }
 
