@@ -1284,6 +1284,9 @@ if (NOT EVENT__DISABLE_BENCHMARK)
         # an opt-in EVENT_BASE_FLAG_IO_URING toggle for head-to-head
         # comparison against the synchronous read/write path.
         add_bench_prog(bench_bufferevent_io test/bench_bufferevent_io.c)
+        if (NOT EVENT__DISABLE_OPENSSL)
+            target_link_libraries(bench_bufferevent_io event_openssl ${OPENSSL_LIBRARIES})
+        endif()
     endif()
 endif()
 

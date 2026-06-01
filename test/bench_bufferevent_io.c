@@ -47,6 +47,60 @@
 #include "event2/buffer.h"
 #include "event2/util.h"
 
+#ifdef EVENT__HAVE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+#include "event2/bufferevent_ssl.h"
+
+static SSL_CTX *bench_server_ctx;
+static SSL_CTX *bench_client_ctx;
+
+static int
+bench_ssl_setup(void)
+{
+	EVP_PKEY *key = EVP_RSA_gen(2048);
+	X509 *cert = X509_new();
+	X509_NAME *name;
+	if (key == NULL || cert == NULL)
+		return -1;
+	X509_set_version(cert, 2);
+	ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+	X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+	X509_gmtime_adj(X509_getm_notAfter(cert), 31536000L);
+	X509_set_pubkey(cert, key);
+	name = X509_get_subject_name(cert);
+	X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+	    (const unsigned char *)"bench", -1, -1, 0);
+	X509_set_issuer_name(cert, name);
+	if (!X509_sign(cert, key, EVP_sha256()))
+		return -1;
+	bench_server_ctx = SSL_CTX_new(TLS_server_method());
+	bench_client_ctx = SSL_CTX_new(TLS_client_method());
+	if (!bench_server_ctx || !bench_client_ctx)
+		return -1;
+	if (SSL_CTX_use_certificate(bench_server_ctx, cert) != 1 ||
+	    SSL_CTX_use_PrivateKey(bench_server_ctx, key) != 1)
+		return -1;
+	SSL_CTX_set_verify(bench_client_ctx, SSL_VERIFY_NONE, NULL);
+	X509_free(cert);
+	EVP_PKEY_free(key);
+	return 0;
+}
+
+static struct bufferevent *
+bench_ssl_wrap(struct event_base *base, evutil_socket_t fd, int server)
+{
+	SSL *ssl = SSL_new(server ? bench_server_ctx : bench_client_ctx);
+	if (ssl == NULL)
+		return NULL;
+	return bufferevent_openssl_socket_new(base, fd, ssl,
+	    server ? BUFFEREVENT_SSL_ACCEPTING : BUFFEREVENT_SSL_CONNECTING,
+	    BEV_OPT_CLOSE_ON_FREE);
+}
+#endif /* EVENT__HAVE_OPENSSL */
+
 struct bench_pair {
 	struct bufferevent *producer;
 	struct bufferevent *consumer;
@@ -115,6 +169,7 @@ usage(const char *prog)
 	fprintf(stderr,
 	    "usage: %s [--uring] [--bytes N] [--rounds R] [--pairs P]\n"
 	    "  --uring           enable EVENT_BASE_FLAG_IO_URING (default off)\n"
+	    "  --ssl             wrap each pair in TLS (bufferevent_openssl_socket_new)\n"
 	    "  --bytes N         payload bytes per round (default 65536)\n"
 	    "  --rounds R        round trips per pair (default 10000)\n"
 	    "  --pairs P         number of concurrent socket pairs (default 1)\n",
@@ -125,6 +180,7 @@ int
 main(int argc, char **argv)
 {
 	int use_uring = 0;
+	int use_ssl = 0;
 	size_t payload_len = 65536;
 	int rounds = 10000;
 	int npairs = 1;
@@ -141,6 +197,8 @@ main(int argc, char **argv)
 	for (i = 1; i < argc; ++i) {
 		if (!strcmp(argv[i], "--uring")) {
 			use_uring = 1;
+		} else if (!strcmp(argv[i], "--ssl")) {
+			use_ssl = 1;
 		} else if (!strcmp(argv[i], "--bytes") && i + 1 < argc) {
 			payload_len = (size_t)strtoull(argv[++i], NULL, 0);
 		} else if (!strcmp(argv[i], "--rounds") && i + 1 < argc) {
@@ -173,6 +231,18 @@ main(int argc, char **argv)
 	if (base == NULL) {
 		fprintf(stderr, "bench: event_base_new_with_config failed\n");
 		return 1;
+	}
+
+	if (use_ssl) {
+#ifdef EVENT__HAVE_OPENSSL
+		if (bench_ssl_setup() < 0) {
+			fprintf(stderr, "bench: TLS setup failed\n");
+			goto fail;
+		}
+#else
+		fprintf(stderr, "bench: built without OpenSSL; --ssl unavailable\n");
+		goto fail;
+#endif
 	}
 
 	payload = malloc(payload_len);
@@ -211,10 +281,18 @@ main(int argc, char **argv)
 
 		p->owner = &state;
 		p->rounds_left = rounds;
-		p->producer = bufferevent_socket_new(base, sv[0],
-		    BEV_OPT_CLOSE_ON_FREE);
-		p->consumer = bufferevent_socket_new(base, sv[1],
-		    BEV_OPT_CLOSE_ON_FREE);
+#ifdef EVENT__HAVE_OPENSSL
+		if (use_ssl) {
+			p->producer = bench_ssl_wrap(base, sv[0], 0);
+			p->consumer = bench_ssl_wrap(base, sv[1], 1);
+		} else
+#endif
+		{
+			p->producer = bufferevent_socket_new(base, sv[0],
+			    BEV_OPT_CLOSE_ON_FREE);
+			p->consumer = bufferevent_socket_new(base, sv[1],
+			    BEV_OPT_CLOSE_ON_FREE);
+		}
 		if (p->producer == NULL || p->consumer == NULL) {
 			fprintf(stderr, "bench: bufferevent_socket_new failed\n");
 			close(sv[0]); close(sv[1]);
@@ -236,8 +314,9 @@ main(int argc, char **argv)
 		}
 	}
 
-	printf("bench_bufferevent_io: mode=%s payload=%zu rounds=%d pairs=%d\n",
-	    use_uring ? "io_uring" : "syscall", payload_len, rounds, npairs);
+	printf("bench_bufferevent_io: mode=%s%s payload=%zu rounds=%d pairs=%d\n",
+	    use_uring ? "io_uring" : "syscall", use_ssl ? "+TLS" : "",
+	    payload_len, rounds, npairs);
 
 	t0 = now_seconds();
 	if (event_base_dispatch(base) < 0) {
