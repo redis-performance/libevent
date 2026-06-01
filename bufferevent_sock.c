@@ -1044,6 +1044,14 @@ be_socket_uring_submit_write_(struct bufferevent *bufev,
 		mm_free(ctx);
 		return -1;
 	}
+	/* evbuffer_peek() returns the number of extents the data spans, which
+	 * may EXCEED the BEV_URING_MAX_IOV entries it actually filled in ctx->vec.
+	 * Clamp to what was written so the loop below never reads past the array
+	 * (heap overflow); the remaining output is sent by the next submission.
+	 * This fires when the output buffer has many chains -- e.g. TLS ciphertext
+	 * records accumulating faster than the socket drains. */
+	if (n > BEV_URING_MAX_IOV)
+		n = BEV_URING_MAX_IOV;
 
 	for (i = 0; i < n; ++i) {
 		size_t avail = ctx->vec[i].iov_len;
