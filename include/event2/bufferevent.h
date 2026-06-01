@@ -171,7 +171,16 @@ enum bufferevent_options {
 	* bufferevent.  This option currently requires that
 	* BEV_OPT_DEFER_CALLBACKS also be set; a future version of Libevent
 	* might remove the requirement.*/
-	BEV_OPT_UNLOCK_CALLBACKS = (1<<3)
+	BEV_OPT_UNLOCK_CALLBACKS = (1<<3),
+
+	/** If set on a bufferevent_openssl_socket_new() bufferevent whose
+	 * event_base has io_uring enabled (EVENT_BASE_FLAG_IO_URING), the
+	 * ciphertext transport is run through an internal socket bufferevent so
+	 * it picks up the io_uring multishot-recv fast path, instead of letting
+	 * OpenSSL issue raw recv()/send() syscalls on the fd.  The fd must
+	 * already be connected.  Ignored when io_uring is unavailable on the
+	 * base (the bufferevent falls back to a plain socket BIO). */
+	BEV_OPT_IO_URING_TLS = (1<<4)
 };
 
 /**

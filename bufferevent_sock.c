@@ -825,6 +825,12 @@ be_socket_should_use_uring_(const struct bufferevent *bufev)
 	return bufev->ev_base != NULL && bufev->ev_base->io_uring != NULL;
 }
 
+int
+bufferevent_base_uses_io_uring_(const struct event_base *base)
+{
+	return base != NULL && base->io_uring != NULL;
+}
+
 static void
 be_socket_uring_read_cb_(int result, void *arg)
 {

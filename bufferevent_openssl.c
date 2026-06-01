@@ -489,6 +489,51 @@ bufferevent_openssl_socket_new(struct event_base *base,
 	} else {
 		/* The SSL isn't configured with a BIO with an fd. */
 		if (fd >= 0) {
+			/* If io_uring is enabled on this base and the caller opted
+			 * in with BEV_OPT_IO_URING_TLS, run the ciphertext transport
+			 * through an internal socket bufferevent so it picks up the
+			 * io_uring multishot-recv fast path, instead of letting
+			 * OpenSSL issue raw recv()/send() on the fd via
+			 * BIO_new_socket().  This is the same composition an
+			 * application would build with bufferevent_openssl_filter_new()
+			 * over a bufferevent_socket_new(), done transparently here.
+			 * The fd must already be connected. */
+			if ((options & BEV_OPT_IO_URING_TLS) &&
+			    bufferevent_base_uses_io_uring_(base)) {
+				struct bufferevent *xport, *bev;
+				BIO *bbio;
+				/* The transport closes the fd iff the caller asked us
+				 * to (BEV_OPT_CLOSE_ON_FREE); thread-safety propagates. */
+				int xopt = options &
+				    (BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+
+				xport = bufferevent_socket_new(base, fd, xopt);
+				if (!xport)
+					goto err;
+				if (!(bbio = BIO_new_bufferevent(xport))) {
+					bufferevent_free(xport);
+					goto err;
+				}
+				SSL_set_bio(ssl, bbio, bbio);
+				/* Hold an extra reference across new_impl so the
+				 * transport is never orphaned if construction fails
+				 * partway; on the rare pre-incref OOM inside new_impl a
+				 * single transport reference may leak, but no use-after
+				 * -free or double-free can occur. */
+				bufferevent_incref_(xport);
+				/* Force BEV_OPT_CLOSE_ON_FREE so the SSL bufferevent owns
+				 * and frees the internal transport (the application never
+				 * sees it); the transport's own xopt decides whether the
+				 * fd is closed, mirroring the caller's intent. */
+				bev = bufferevent_ssl_new_impl(base, xport, -1, ssl,
+				    state, options | BEV_OPT_CLOSE_ON_FREE,
+				    &le_openssl_ops);
+				bufferevent_decref_(xport);
+				/* On failure new_impl already freed ssl (we passed it
+				 * CLOSE_ON_FREE), so return directly rather than falling
+				 * through to err: which would free ssl a second time. */
+				return bev;
+			}
 			/* ... and we have an fd we want to use. */
 			bio = BIO_new_socket((int)fd, 0);
 			SSL_set_bio(ssl, bio, bio);

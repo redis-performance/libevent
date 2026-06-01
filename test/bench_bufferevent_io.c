@@ -90,14 +90,15 @@ bench_ssl_setup(void)
 }
 
 static struct bufferevent *
-bench_ssl_wrap(struct event_base *base, evutil_socket_t fd, int server)
+bench_ssl_wrap(struct event_base *base, evutil_socket_t fd, int server,
+    int extra_opts)
 {
 	SSL *ssl = SSL_new(server ? bench_server_ctx : bench_client_ctx);
 	if (ssl == NULL)
 		return NULL;
 	return bufferevent_openssl_socket_new(base, fd, ssl,
 	    server ? BUFFEREVENT_SSL_ACCEPTING : BUFFEREVENT_SSL_CONNECTING,
-	    BEV_OPT_CLOSE_ON_FREE);
+	    BEV_OPT_CLOSE_ON_FREE | extra_opts);
 }
 #endif /* EVENT__HAVE_OPENSSL */
 
@@ -283,8 +284,9 @@ main(int argc, char **argv)
 		p->rounds_left = rounds;
 #ifdef EVENT__HAVE_OPENSSL
 		if (use_ssl) {
-			p->producer = bench_ssl_wrap(base, sv[0], 0);
-			p->consumer = bench_ssl_wrap(base, sv[1], 1);
+			int ssl_opts = use_uring ? BEV_OPT_IO_URING_TLS : 0;
+			p->producer = bench_ssl_wrap(base, sv[0], 0, ssl_opts);
+			p->consumer = bench_ssl_wrap(base, sv[1], 1, ssl_opts);
 		} else
 #endif
 		{

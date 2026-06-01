@@ -409,6 +409,13 @@ void bufferevent_incref_and_lock_(struct bufferevent *bufev);
 EVENT2_EXPORT_SYMBOL
 int bufferevent_decref_and_unlock_(struct bufferevent *bufev);
 
+/** Internal: Return true if @a base has the io_uring backend enabled
+ * (EVENT_BASE_FLAG_IO_URING was set and the platform supports it). Lets
+ * non-socket bufferevent code decide whether to route I/O through io_uring
+ * without pulling in event-internal.h. */
+EVENT2_EXPORT_SYMBOL
+int bufferevent_base_uses_io_uring_(const struct event_base *base);
+
 /** Internal: If callbacks are deferred and we have a read callback, schedule
  * a readcb.  Otherwise just run the readcb. Ignores watermarks. */
 EVENT2_EXPORT_SYMBOL
