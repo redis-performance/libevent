@@ -3661,6 +3661,60 @@ end:
 #endif
 }
 
+/* Regression test for the timerfd disarm-skip: skipping a redundant
+ * timerfd_settime() disarm must not lose a subsequently re-armed timeout.
+ * Arms a timer, fires it, runs disarm-only iterations, then re-arms and
+ * verifies the new timeout still fires. With PRECISE_TIMER on Linux this
+ * exercises the timerfd path; elsewhere it is a plain timer correctness
+ * guard. */
+static int timerfd_skip_fired;
+static void
+timerfd_skip_cb(evutil_socket_t fd, short what, void *arg)
+{
+	++timerfd_skip_fired;
+}
+static void
+test_timerfd_disarm_skip(void *arg)
+{
+	struct event_config *cfg = NULL;
+	struct event_base *base = NULL;
+	struct event *t = NULL;
+	struct timeval ms10 = { 0, 10*1000 };
+	int i;
+
+	cfg = event_config_new();
+	event_config_set_flag(cfg, EVENT_BASE_FLAG_PRECISE_TIMER);
+	base = event_base_new_with_config(cfg);
+	tt_assert(base);
+
+	timerfd_skip_fired = 0;
+	t = evtimer_new(base, timerfd_skip_cb, NULL);
+	tt_assert(t);
+
+	/* Arm and fire once (arms the timerfd). */
+	tt_int_op(0, ==, evtimer_add(t, &ms10));
+	tt_int_op(event_base_dispatch(base), >=, 0);
+	tt_int_op(timerfd_skip_fired, ==, 1);
+
+	/* No timers pending: repeated non-blocking loops hit the disarm path
+	 * (and, after the first, the disarm-already-disarmed skip). */
+	for (i = 0; i < 5; ++i)
+		tt_int_op(event_base_loop(base, EVLOOP_NONBLOCK), >=, 0);
+
+	/* Re-arm: a real timerfd_settime() must still happen and the timer fire. */
+	tt_int_op(0, ==, evtimer_add(t, &ms10));
+	tt_int_op(event_base_dispatch(base), >=, 0);
+	tt_int_op(timerfd_skip_fired, ==, 2);
+
+end:
+	if (t)
+		event_free(t);
+	if (base)
+		event_base_free(base);
+	if (cfg)
+		event_config_free(cfg);
+}
+
 struct testcase_t main_testcases[] = {
 	/* Some converted-over tests */
 	{ "methods", test_methods, TT_FORK, NULL, NULL },
@@ -3760,6 +3814,7 @@ struct testcase_t main_testcases[] = {
 	{ "gettimeofday_cached_reset", test_gettimeofday_cached, TT_FORK, &basic_setup, (void*)"sleep reset" },
 	{ "gettimeofday_cached_disabled", test_gettimeofday_cached, TT_FORK, &basic_setup, (void*)"sleep disable" },
 	{ "gettimeofday_cached_disabled_nosleep", test_gettimeofday_cached, TT_FORK, &basic_setup, (void*)"disable" },
+	{ "timerfd_disarm_skip", test_timerfd_disarm_skip, TT_FORK, &basic_setup, NULL },
 
 	BASIC(active_by_fd, TT_FORK|TT_NEED_BASE|TT_NEED_SOCKETPAIR),
 

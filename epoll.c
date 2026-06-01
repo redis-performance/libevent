@@ -107,6 +107,12 @@ struct epollop {
 	epoll_handle epfd;
 #ifdef USING_TIMERFD
 	int timerfd;
+	/* Last itimerspec passed to timerfd_settime(); lets us skip a
+	 * redundant disarm syscall when the timer is already disarmed.
+	 * Guards ONLY the disarm-when-already-disarmed case -- re-arms are
+	 * never skipped (the timer is relative, so the deadline always moves).
+	 * Zero-initialized by mm_calloc() in epoll_init(). */
+	struct itimerspec last_timerfd_set;
 #endif
 };
 
@@ -486,12 +492,23 @@ epoll_dispatch(struct event_base *base, struct timeval *tv)
 			is.it_value.tv_sec = tv->tv_sec;
 			is.it_value.tv_nsec = tv->tv_usec * 1000;
 		}
-		/* TODO: we could avoid unnecessary syscalls here by only
-		   calling timerfd_settime when the top timeout changes, or
-		   when we're called with a different timeval.
-		*/
-		if (timerfd_settime(epollop->timerfd, 0, &is, NULL) < 0) {
-			event_warn("timerfd_settime");
+		/* Avoid a redundant syscall when the timer is already
+		 * disarmed and we are disarming again (common on workloads
+		 * with no pending timeouts): only skip when both the new and
+		 * the last value are zero. A re-arm (is.it_value != 0) always
+		 * calls timerfd_settime() because the timer is relative and
+		 * the deadline moves every dispatch. Only it_value is compared
+		 * because it_interval is always {0,0} on this path. */
+		if (is.it_value.tv_sec != 0 || is.it_value.tv_nsec != 0 ||
+			epollop->last_timerfd_set.it_value.tv_sec != 0 ||
+			epollop->last_timerfd_set.it_value.tv_nsec != 0) {
+			if (timerfd_settime(epollop->timerfd, 0, &is, NULL) < 0) {
+				event_warn("timerfd_settime");
+			} else {
+				/* Cache only on success; a failed disarm must
+				 * not record a disarmed state we never reached. */
+				epollop->last_timerfd_set = is;
+			}
 		}
 	} else
 #endif
