@@ -56,8 +56,36 @@
  * in the CQE flags. The pool is one large allocation carved into N equal
  * slots. NBUFS must be a power of two (io_uring_buf_ring_mask). */
 #define EVENT_IO_URING_BUF_NBUFS    128
+/* Stop handing out zero-copy references once fewer than this many provided
+ * buffers remain free, so one slow consumer cannot pin the shared pool and
+ * starve multishot on other connections. 16/128 (~12.5%) keeps a reserve for
+ * the other readers on the base while leaving the vast majority for zero-copy. */
+#define EVENT_IO_URING_BUF_LOWWATER 16
 #define EVENT_IO_URING_BUF_SIZE     (16 * 1024)
 #define EVENT_IO_URING_BUF_GROUP_ID 0
+
+/* Refcounted backing for the provided buffer pool. It outlives the
+ * event_base: a zero-copy recv references a provided buffer into an
+ * application-owned evbuffer that may be drained or freed after
+ * event_base_free(). The base holds one reference; each live zero-copy
+ * reference holds one more. buf_pool (the data the references point at)
+ * and this struct are freed only when the last reference drops, so a
+ * cleanup running after teardown is safe and never touches the freed
+ * event_io_uring or its ring. */
+struct event_io_uring_bufpool;
+struct event_io_uring_relctx {
+	struct event_io_uring_bufpool *bp;
+	unsigned short bid;
+};
+struct event_io_uring_bufpool {
+	int refcount;
+	int alive;            /* 0 once the owning ring has been torn down */
+	unsigned inflight;    /* provided buffers currently held by references */
+	struct io_uring_buf_ring *buf_ring;
+	int buf_ring_mask;
+	void *buf_pool;
+	struct event_io_uring_relctx relctx[EVENT_IO_URING_BUF_NBUFS];
+};
 
 struct event_io_uring {
 	struct io_uring ring;
@@ -76,10 +104,29 @@ struct event_io_uring {
 	/* Provided buffer ring for multishot recv. NULL when the kernel
 	 * doesn't support it; submission helpers will then fail and callers
 	 * fall back to one-shot readv. */
-	struct io_uring_buf_ring *buf_ring;
-	void *buf_pool;
-	int buf_ring_mask;
+	struct event_io_uring_bufpool *bp;
 };
+
+/* Drop the base's reference to the buffer pool and tear down the ring's
+ * buffer-ring registration (it belongs to the io_uring being destroyed).
+ * buf_pool and the bufpool struct survive until the last outstanding
+ * zero-copy reference is released. */
+static void
+event_io_uring_bufpool_release_(struct event_io_uring *r)
+{
+	struct event_io_uring_bufpool *bp = r->bp;
+	if (bp == NULL)
+		return;
+	io_uring_free_buf_ring(&r->ring, bp->buf_ring,
+	    EVENT_IO_URING_BUF_NBUFS, EVENT_IO_URING_BUF_GROUP_ID);
+	bp->buf_ring = NULL;
+	bp->alive = 0;
+	r->bp = NULL;
+	if (--bp->refcount == 0) {
+		mm_free(bp->buf_pool);
+		mm_free(bp);
+	}
+}
 
 static void
 event_io_uring_notify_cb_(evutil_socket_t fd, short what, void *arg)
@@ -131,32 +178,42 @@ event_io_uring_init_(struct event_base *base)
 	 * fall back to one-shot readv. */
 	{
 		int err = 0;
-		r->buf_ring = io_uring_setup_buf_ring(&r->ring,
+		struct io_uring_buf_ring *buf_ring;
+		struct event_io_uring_bufpool *bp;
+		void *pool;
+		buf_ring = io_uring_setup_buf_ring(&r->ring,
 		    EVENT_IO_URING_BUF_NBUFS,
 		    EVENT_IO_URING_BUF_GROUP_ID, 0, &err);
-		if (r->buf_ring != NULL) {
-			unsigned i;
-			r->buf_pool = mm_malloc(
+		if (buf_ring != NULL) {
+			bp = mm_calloc(1, sizeof(*bp));
+			pool = mm_malloc(
 			    (size_t)EVENT_IO_URING_BUF_NBUFS *
 			    EVENT_IO_URING_BUF_SIZE);
-			if (r->buf_pool == NULL) {
-				io_uring_free_buf_ring(&r->ring, r->buf_ring,
+			if (bp == NULL || pool == NULL) {
+				mm_free(bp);
+				mm_free(pool);
+				io_uring_free_buf_ring(&r->ring, buf_ring,
 				    EVENT_IO_URING_BUF_NBUFS,
 				    EVENT_IO_URING_BUF_GROUP_ID);
-				r->buf_ring = NULL;
 			} else {
-				r->buf_ring_mask = io_uring_buf_ring_mask(
+				unsigned i;
+				bp->refcount = 1;
+				bp->alive = 1;
+				bp->buf_ring = buf_ring;
+				bp->buf_pool = pool;
+				bp->buf_ring_mask = io_uring_buf_ring_mask(
 				    EVENT_IO_URING_BUF_NBUFS);
 				for (i = 0; i < EVENT_IO_URING_BUF_NBUFS; ++i) {
-					io_uring_buf_ring_add(r->buf_ring,
-					    (char *)r->buf_pool +
+					io_uring_buf_ring_add(buf_ring,
+					    (char *)pool +
 					    (size_t)i * EVENT_IO_URING_BUF_SIZE,
 					    EVENT_IO_URING_BUF_SIZE,
 					    (unsigned short)i,
-					    r->buf_ring_mask, (int)i);
+					    bp->buf_ring_mask, (int)i);
 				}
-				io_uring_buf_ring_advance(r->buf_ring,
+				io_uring_buf_ring_advance(buf_ring,
 				    EVENT_IO_URING_BUF_NBUFS);
+				r->bp = bp;
 			}
 		} else if (err != -ENOSYS && err != -EINVAL) {
 			event_warnx("%s: io_uring_setup_buf_ring: %s",
@@ -175,12 +232,7 @@ event_io_uring_init_(struct event_base *base)
 	    EV_READ | EV_PERSIST, event_io_uring_notify_cb_, r);
 	if (event_add(&r->notify_ev, NULL) < 0) {
 		event_warnx("%s: event_add(notify) failed", __func__);
-		if (r->buf_ring) {
-			io_uring_free_buf_ring(&r->ring, r->buf_ring,
-			    EVENT_IO_URING_BUF_NBUFS,
-			    EVENT_IO_URING_BUF_GROUP_ID);
-			mm_free(r->buf_pool);
-		}
+		event_io_uring_bufpool_release_(r);
 		io_uring_queue_exit(&r->ring);
 		mm_free(r);
 		return -1;
@@ -238,11 +290,7 @@ event_io_uring_free_(struct event_base *base)
 		}
 	}
 
-	if (r->buf_ring) {
-		io_uring_free_buf_ring(&r->ring, r->buf_ring,
-		    EVENT_IO_URING_BUF_NBUFS, EVENT_IO_URING_BUF_GROUP_ID);
-		mm_free(r->buf_pool);
-	}
+	event_io_uring_bufpool_release_(r);
 	io_uring_queue_exit(&r->ring);
 	mm_free(r);
 	base->io_uring = NULL;
@@ -363,7 +411,7 @@ event_io_uring_submit_recv_multishot_(struct event_base *base, int fd,
 	struct io_uring_sqe *sqe;
 	struct event_io_uring_req *req;
 
-	if (r == NULL || r->buf_ring == NULL)
+	if (r == NULL || r->bp == NULL)
 		return -1;
 
 	sqe = event_io_uring_alloc_sqe_(r, arg, &req);
@@ -424,21 +472,87 @@ void *
 event_io_uring_buf_addr_(struct event_base *base, unsigned short bid)
 {
 	struct event_io_uring *r = base->io_uring;
-	if (r == NULL || r->buf_pool == NULL)
+	if (r == NULL || r->bp == NULL)
 		return NULL;
-	return (char *)r->buf_pool + (size_t)bid * EVENT_IO_URING_BUF_SIZE;
+	return (char *)r->bp->buf_pool + (size_t)bid * EVENT_IO_URING_BUF_SIZE;
+}
+
+void
+event_io_uring_evref_release_(const void *data, size_t datalen, void *extra)
+{
+	struct event_io_uring_relctx *c = extra;
+	struct event_io_uring_bufpool *bp = c->bp;
+	(void)data;
+	(void)datalen;
+	/* Return the buffer to the ring only while the owning base is alive;
+	 * after teardown the ring is gone and we just drop the reference.
+	 * This never dereferences base->io_uring, so it is safe to run after
+	 * event_base_free(). */
+	if (bp->alive && bp->buf_ring != NULL) {
+		io_uring_buf_ring_add(bp->buf_ring,
+		    (char *)bp->buf_pool +
+		    (size_t)c->bid * EVENT_IO_URING_BUF_SIZE,
+		    EVENT_IO_URING_BUF_SIZE, c->bid, bp->buf_ring_mask, 0);
+		io_uring_buf_ring_advance(bp->buf_ring, 1);
+	}
+	EVUTIL_ASSERT(bp->inflight > 0);
+	bp->inflight--;
+	if (--bp->refcount == 0) {
+		mm_free(bp->buf_pool);
+		mm_free(bp);
+	}
+}
+
+void *
+event_io_uring_buf_relctx_(struct event_base *base, unsigned short bid)
+{
+	struct event_io_uring *r = base->io_uring;
+	struct event_io_uring_bufpool *bp;
+	if (r == NULL || r->bp == NULL)
+		return NULL;
+	bp = r->bp;
+	/* Bound the shared pool: once free buffers run low, fall back to the
+	 * copy path (caller copies + releases immediately) so a single slow
+	 * consumer cannot pin the pool and starve other connections. */
+	if (bp->inflight + EVENT_IO_URING_BUF_LOWWATER >=
+	    EVENT_IO_URING_BUF_NBUFS)
+		return NULL;
+	bp->relctx[bid].bp = bp;
+	bp->relctx[bid].bid = bid;
+	bp->refcount++;
+	bp->inflight++;
+	return &bp->relctx[bid];
+}
+
+/* Undo the reference event_io_uring_buf_relctx_() reserved, for when the
+ * caller could not attach the cleanup (evbuffer_add_reference failed) and
+ * takes the copy path instead. Reverses the bookkeeping only; the buffer
+ * itself is returned to the ring by the caller's event_io_uring_buf_release_. */
+void
+event_io_uring_buf_relctx_undo_(void *ctx)
+{
+	struct event_io_uring_relctx *c = ctx;
+	struct event_io_uring_bufpool *bp = c->bp;
+	EVUTIL_ASSERT(bp->inflight > 0);
+	bp->inflight--;
+	if (--bp->refcount == 0) {
+		mm_free(bp->buf_pool);
+		mm_free(bp);
+	}
 }
 
 void
 event_io_uring_buf_release_(struct event_base *base, unsigned short bid)
 {
 	struct event_io_uring *r = base->io_uring;
-	if (r == NULL || r->buf_ring == NULL)
+	struct event_io_uring_bufpool *bp;
+	if (r == NULL || r->bp == NULL || !r->bp->alive)
 		return;
-	io_uring_buf_ring_add(r->buf_ring,
-	    (char *)r->buf_pool + (size_t)bid * EVENT_IO_URING_BUF_SIZE,
-	    EVENT_IO_URING_BUF_SIZE, bid, r->buf_ring_mask, 0);
-	io_uring_buf_ring_advance(r->buf_ring, 1);
+	bp = r->bp;
+	io_uring_buf_ring_add(bp->buf_ring,
+	    (char *)bp->buf_pool + (size_t)bid * EVENT_IO_URING_BUF_SIZE,
+	    EVENT_IO_URING_BUF_SIZE, bid, bp->buf_ring_mask, 0);
+	io_uring_buf_ring_advance(bp->buf_ring, 1);
 }
 
 void

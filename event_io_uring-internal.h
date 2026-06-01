@@ -103,6 +103,10 @@ unsigned short event_io_uring_cqe_buf_id_(unsigned cqe_flags);
 
 /* Read the data backing a buffer id delivered by a multishot recv CQE. */
 void *event_io_uring_buf_addr_(struct event_base *base, unsigned short bid);
+void event_io_uring_evref_release_(const void *data, size_t datalen,
+    void *extra);
+void *event_io_uring_buf_relctx_(struct event_base *base, unsigned short bid);
+void event_io_uring_buf_relctx_undo_(void *ctx);
 
 /* Return a previously-delivered buffer to the kernel's provided buffer
  * ring so it can be reused for a subsequent recv. Must be called

@@ -393,6 +393,134 @@ end:
 		event_base_free(base);
 }
 
+/* A zero-copy recv references provided buffers into the input evbuffer.
+ * Move them into a standalone evbuffer, free the bufferevents AND the base
+ * (tearing down the buffer pool), then free the stolen evbuffer: the
+ * release callbacks run after teardown and must be safe (the refcounted
+ * pool outlives the base). Without that, this is a use-after-free. */
+static void
+test_io_uring_recv_ref_outlives_base(void *arg)
+{
+	struct event_base *base = NULL;
+	struct bufferevent *rd = NULL, *wr = NULL;
+	evutil_socket_t sv[2] = { -1, -1 };
+	struct evbuffer *steal = NULL;
+	char *payload = NULL;
+	size_t n = 64 * 1024;
+	int i;
+
+	(void)arg;
+	base = make_uring_base(0);
+	tt_assert(base != NULL);
+	SKIP_IF_NO_URING(base);
+
+	tt_assert(evutil_socketpair(AF_UNIX,
+	    SOCK_STREAM | EVUTIL_SOCK_NONBLOCK, 0, sv) == 0);
+	rd = bufferevent_socket_new(base, sv[0], BEV_OPT_CLOSE_ON_FREE);
+	wr = bufferevent_socket_new(base, sv[1], BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(rd != NULL);
+	tt_assert(wr != NULL);
+	sv[0] = sv[1] = -1;
+
+	payload = malloc(n);
+	tt_assert(payload != NULL);
+	memset(payload, 'x', n);
+
+	tt_assert(bufferevent_enable(rd, EV_READ) == 0);
+	tt_assert(bufferevent_write(wr, payload, n) == 0);
+	for (i = 0; i < 50; ++i)
+		event_base_loop(base, EVLOOP_NONBLOCK);
+
+	steal = evbuffer_new();
+	tt_assert(steal != NULL);
+	tt_assert(evbuffer_add_buffer(steal,
+	    bufferevent_get_input(rd)) == 0);
+
+	bufferevent_free(rd); rd = NULL;
+	bufferevent_free(wr); wr = NULL;
+	event_base_free(base); base = NULL;
+
+	/* Runs release callbacks after teardown -- must not fault. */
+	evbuffer_free(steal); steal = NULL;
+
+end:
+	if (rd)
+		bufferevent_free(rd);
+	if (wr)
+		bufferevent_free(wr);
+	if (steal)
+		evbuffer_free(steal);
+	if (sv[0] >= 0)
+		evutil_closesocket(sv[0]);
+	if (sv[1] >= 0)
+		evutil_closesocket(sv[1]);
+	if (base)
+		event_base_free(base);
+	free(payload);
+}
+
+/* Write far more than the provided-buffer pool can hold without draining,
+ * so the low-water bound forces copy fallback. Reads must keep flowing
+ * (no pool starvation stall) and the data must be intact -- zero-copy and
+ * the copy fallback must be transparent under pool pressure. */
+static void
+test_io_uring_pool_pressure(void *arg)
+{
+	struct event_base *base = NULL;
+	struct bufferevent *rd = NULL, *wr = NULL;
+	evutil_socket_t sv[2] = { -1, -1 };
+	char *payload = NULL;
+	size_t n = 4 * 1024 * 1024;
+	struct timeval cap = { 5, 0 };
+	struct evbuffer *in;
+	unsigned char *p;
+
+	(void)arg;
+	base = make_uring_base(0);
+	tt_assert(base != NULL);
+	SKIP_IF_NO_URING(base);
+
+	tt_assert(evutil_socketpair(AF_UNIX,
+	    SOCK_STREAM | EVUTIL_SOCK_NONBLOCK, 0, sv) == 0);
+	rd = bufferevent_socket_new(base, sv[0], BEV_OPT_CLOSE_ON_FREE);
+	wr = bufferevent_socket_new(base, sv[1], BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(rd != NULL);
+	tt_assert(wr != NULL);
+	sv[0] = sv[1] = -1;
+
+	payload = malloc(n);
+	tt_assert(payload != NULL);
+	memset(payload, 'y', n);
+
+	/* No read callback: input accumulates, pinning buffers. */
+	tt_assert(bufferevent_enable(rd, EV_READ) == 0);
+	tt_assert(bufferevent_enable(wr, EV_WRITE) == 0);
+	tt_assert(bufferevent_write(wr, payload, n) == 0);
+	event_base_loopexit(base, &cap);
+	event_base_dispatch(base);
+
+	in = bufferevent_get_input(rd);
+	/* Reads continued well past the pool capacity (128 x 16 KiB). */
+	tt_int_op(evbuffer_get_length(in), >, 256 * 1024);
+	p = evbuffer_pullup(in, 4096);
+	tt_assert(p != NULL);
+	tt_assert(p[0] == 'y');
+	tt_assert(p[4095] == 'y');
+
+end:
+	if (rd)
+		bufferevent_free(rd);
+	if (wr)
+		bufferevent_free(wr);
+	if (sv[0] >= 0)
+		evutil_closesocket(sv[0]);
+	if (sv[1] >= 0)
+		evutil_closesocket(sv[1]);
+	if (base)
+		event_base_free(base);
+	free(payload);
+}
+
 /* Tests run without basic_setup since each test creates its own base with
  * the io_uring flag set. */
 struct testcase_t io_uring_testcases[] = {
@@ -407,6 +535,9 @@ struct testcase_t io_uring_testcases[] = {
 	{ "read_timeout", test_io_uring_read_timeout, TT_FORK, NULL, NULL },
 	{ "read_timeout_after_enable", test_io_uring_read_timeout_after_enable,
 	  TT_FORK, NULL, NULL },
+	{ "recv_ref_outlives_base", test_io_uring_recv_ref_outlives_base,
+	  TT_FORK, NULL, NULL },
+	{ "pool_pressure", test_io_uring_pool_pressure, TT_FORK, NULL, NULL },
 	END_OF_TESTCASES
 };
 

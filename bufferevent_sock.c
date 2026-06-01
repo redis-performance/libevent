@@ -1167,13 +1167,36 @@ be_socket_uring_recv_cb_(int result, unsigned cqe_flags, void *arg)
 		unsigned short bid = event_io_uring_cqe_buf_id_(cqe_flags);
 		void *data = event_io_uring_buf_addr_(bufev->ev_base, bid);
 		if (data != NULL) {
+			void *relctx =
+			    event_io_uring_buf_relctx_(bufev->ev_base, bid);
+			int zerocopy = 0;
 			evbuffer_unfreeze(bufev->input, 0);
-			evbuffer_add(bufev->input, data, (size_t)result);
+			if (relctx != NULL) {
+				/* Zero-copy: reference the kernel-filled
+				 * provided buffer directly; the cleanup
+				 * callback returns it to the ring when the
+				 * referencing evbuffer chain is freed. */
+				if (evbuffer_add_reference(bufev->input, data,
+					(size_t)result,
+					event_io_uring_evref_release_,
+					relctx) == 0)
+					zerocopy = 1;
+				else
+					/* The reference was not attached, so
+					 * the cleanup will never run; undo the
+					 * pool accounting relctx_ reserved. */
+					event_io_uring_buf_relctx_undo_(relctx);
+			}
+			if (!zerocopy) {
+				evbuffer_add(bufev->input, data, (size_t)result);
+				event_io_uring_buf_release_(bufev->ev_base, bid);
+			}
 			evbuffer_freeze(bufev->input, 0);
 			bufferevent_decrement_read_buckets_(bufev_p, result);
 			trigger_user = 1;
+		} else {
+			event_io_uring_buf_release_(bufev->ev_base, bid);
 		}
-		event_io_uring_buf_release_(bufev->ev_base, bid);
 	} else if (result == 0) {
 		/* EOF — peer closed write side. */
 		what |= BEV_EVENT_EOF;
