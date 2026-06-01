@@ -2078,7 +2078,11 @@ event_base_loop(struct event_base *base, int flags)
 			goto done;
 		}
 
-		update_time_cache(base);
+		/* Skip cache refresh only when non-blocking AND no pending timeouts:
+		 * EVLOOP_NONBLOCK polls with timeout=0 so timeout_process won't fire,
+		 * and an empty heap means no EV_PERSIST timeout rescheduling either. */
+		if (!(flags & EVLOOP_NONBLOCK) || !min_heap_empty_(&base->timeheap))
+			update_time_cache(base);
 
 		/* Invoke check watchers after polling for events, and before
 		 * processing them */
