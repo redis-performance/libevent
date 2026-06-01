@@ -178,8 +178,11 @@ enum bufferevent_options {
 	 * ciphertext transport is run through an internal socket bufferevent so
 	 * it picks up the io_uring multishot-recv fast path, instead of letting
 	 * OpenSSL issue raw recv()/send() syscalls on the fd.  The fd must
-	 * already be connected.  Ignored when io_uring is unavailable on the
-	 * base (the bufferevent falls back to a plain socket BIO). */
+	 * already be connected and is fixed for the lifetime of the bufferevent
+	 * (bufferevent_setfd() does not re-point the internal transport).  This
+	 * option also requires BEV_OPT_CLOSE_ON_FREE (the bufferevent owns the
+	 * connection); without it, or when io_uring is unavailable on the base,
+	 * it is ignored and the bufferevent falls back to a plain socket BIO. */
 	BEV_OPT_IO_URING_TLS = (1<<4)
 };
 

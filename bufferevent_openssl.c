@@ -490,22 +490,27 @@ bufferevent_openssl_socket_new(struct event_base *base,
 		/* The SSL isn't configured with a BIO with an fd. */
 		if (fd >= 0) {
 			/* If io_uring is enabled on this base and the caller opted
-			 * in with BEV_OPT_IO_URING_TLS, run the ciphertext transport
-			 * through an internal socket bufferevent so it picks up the
-			 * io_uring multishot-recv fast path, instead of letting
+			 * in with BEV_OPT_IO_URING_TLS -- and asked us to own the
+			 * connection with BEV_OPT_CLOSE_ON_FREE -- run the ciphertext
+			 * transport through an internal socket bufferevent so it picks
+			 * up the io_uring multishot-recv fast path, instead of letting
 			 * OpenSSL issue raw recv()/send() on the fd via
 			 * BIO_new_socket().  This is the same composition an
 			 * application would build with bufferevent_openssl_filter_new()
 			 * over a bufferevent_socket_new(), done transparently here.
-			 * The fd must already be connected. */
+			 * The fd must already be connected and is fixed for the life of
+			 * the bufferevent (bufferevent_setfd() does not re-point the
+			 * internal transport).  Requiring BEV_OPT_CLOSE_ON_FREE keeps
+			 * ssl- and fd-ownership identical to the plain socket path:
+			 * new_impl is handed the caller's own options unchanged, so it
+			 * frees ssl on failure exactly when the caller asked. */
 			if ((options & BEV_OPT_IO_URING_TLS) &&
+			    (options & BEV_OPT_CLOSE_ON_FREE) &&
 			    bufferevent_base_uses_io_uring_(base)) {
-				struct bufferevent *xport, *bev;
-				BIO *bbio;
-				/* The transport closes the fd iff the caller asked us
-				 * to (BEV_OPT_CLOSE_ON_FREE); thread-safety propagates. */
 				int xopt = options &
 				    (BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+				struct bufferevent *xport, *bev;
+				BIO *bbio;
 
 				xport = bufferevent_socket_new(base, fd, xopt);
 				if (!xport)
@@ -515,23 +520,21 @@ bufferevent_openssl_socket_new(struct event_base *base,
 					goto err;
 				}
 				SSL_set_bio(ssl, bbio, bbio);
-				/* Hold an extra reference across new_impl so the
-				 * transport is never orphaned if construction fails
-				 * partway; on the rare pre-incref OOM inside new_impl a
-				 * single transport reference may leak, but no use-after
-				 * -free or double-free can occur. */
+				/* Hold an extra reference across new_impl so the transport
+				 * is never orphaned if construction fails partway.  The SSL
+				 * bufferevent owns and frees the internal transport via the
+				 * caller's BEV_OPT_CLOSE_ON_FREE (required above); the
+				 * transport's xopt closes the fd, mirroring caller intent.
+				 * A single transport reference can leak only on a true OOM
+				 * inside new_impl before it adopts the transport; no
+				 * use-after-free or double-free can occur. */
 				bufferevent_incref_(xport);
-				/* Force BEV_OPT_CLOSE_ON_FREE so the SSL bufferevent owns
-				 * and frees the internal transport (the application never
-				 * sees it); the transport's own xopt decides whether the
-				 * fd is closed, mirroring the caller's intent. */
 				bev = bufferevent_ssl_new_impl(base, xport, -1, ssl,
-				    state, options | BEV_OPT_CLOSE_ON_FREE,
-				    &le_openssl_ops);
+				    state, options, &le_openssl_ops);
 				bufferevent_decref_(xport);
-				/* On failure new_impl already freed ssl (we passed it
-				 * CLOSE_ON_FREE), so return directly rather than falling
-				 * through to err: which would free ssl a second time. */
+				/* On failure new_impl already freed ssl (CLOSE_ON_FREE is
+				 * set), so return directly rather than falling through to
+				 * err: which would free ssl a second time. */
 				return bev;
 			}
 			/* ... and we have an fd we want to use. */
