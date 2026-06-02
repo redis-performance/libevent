@@ -637,7 +637,14 @@ be_socket_enable(struct bufferevent *bufev, short event)
 		if (!bufev_p->uring_recv_multishot &&
 		    be_socket_should_use_uring_(bufev)) {
 			evutil_socket_t fd = event_get_fd(&bufev->ev_read);
-			if (be_socket_uring_submit_recv_multishot_(bufev, fd) == 0)
+			/* Only submit when we actually have a connected fd. A
+			 * bufferevent can be enabled before its fd is assigned
+			 * (connect-later / SSL startopen); a multishot recv on
+			 * fd -1 just completes with EBADF and tears the read
+			 * down. The epoll path below handles fd -1 gracefully
+			 * (the event stays dormant until the fd is set). */
+			if (fd >= 0 &&
+			    be_socket_uring_submit_recv_multishot_(bufev, fd) == 0)
 				goto skip_read_event_add;
 		}
 		if (bufferevent_add_event_(&bufev->ev_read, &bufev->timeout_read) == -1)
