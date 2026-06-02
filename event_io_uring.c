@@ -230,6 +230,12 @@ event_io_uring_init_(struct event_base *base)
 	(void)evutil_make_socket_nonblocking(r->ring.ring_fd);
 	event_assign(&r->notify_ev, base, r->ring.ring_fd,
 	    EV_READ | EV_PERSIST, event_io_uring_notify_cb_, r);
+	/* The ring's CQE-wakeup event must not, by itself, keep the event loop
+	 * alive: otherwise event_base_dispatch() never returns once io_uring is
+	 * enabled, even with no pending work.  Mark it internal; loop lifetime is
+	 * instead tied to actual in-flight io_uring operations, each of which adds
+	 * a virtual event (see be_socket_uring_* in bufferevent_sock.c). */
+	r->notify_ev.ev_flags |= EVLIST_INTERNAL;
 	if (event_add(&r->notify_ev, NULL) < 0) {
 		event_warnx("%s: event_add(notify) failed", __func__);
 		event_io_uring_bufpool_release_(r);

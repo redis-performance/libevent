@@ -916,6 +916,7 @@ be_socket_uring_read_cb_(int result, void *arg)
  done:
 	(void)rescheduling;
 	mm_free(ctx);
+	event_base_del_virtual_(bufev->ev_base);
 	bufferevent_decref_and_unlock_(bufev);
 }
 
@@ -963,12 +964,14 @@ be_socket_uring_submit_read_(struct bufferevent *bufev,
 	ctx->nvec = n;
 
 	bufferevent_incref_(bufev);
+	event_base_add_virtual_(bufev->ev_base);
 	bufev_p->uring_read_in_flight = 1;
 
 	if (event_io_uring_submit_readv_(bufev->ev_base, fd,
 	    (struct iovec *)ctx->vec, (unsigned)ctx->nvec,
 	    be_socket_uring_read_cb_, ctx) < 0) {
 		bufev_p->uring_read_in_flight = 0;
+		event_base_del_virtual_(bufev->ev_base);
 		bufferevent_decref_(bufev);
 		evbuffer_freeze(bufev->input, 0);
 		mm_free(ctx);
@@ -1031,6 +1034,7 @@ be_socket_uring_write_cb_(int result, void *arg)
  done:
 	(void)rescheduling;
 	mm_free(ctx);
+	event_base_del_virtual_(bufev->ev_base);
 	bufferevent_decref_and_unlock_(bufev);
 }
 
@@ -1085,12 +1089,14 @@ be_socket_uring_submit_write_(struct bufferevent *bufev,
 	ctx->nvec = n;
 
 	bufferevent_incref_(bufev);
+	event_base_add_virtual_(bufev->ev_base);
 	bufev_p->uring_write_in_flight = 1;
 
 	if (event_io_uring_submit_writev_(bufev->ev_base, fd,
 	    (struct iovec *)ctx->vec, (unsigned)ctx->nvec,
 	    be_socket_uring_write_cb_, ctx) < 0) {
 		bufev_p->uring_write_in_flight = 0;
+		event_base_del_virtual_(bufev->ev_base);
 		bufferevent_decref_(bufev);
 		evbuffer_freeze(bufev->output, 1);
 		mm_free(ctx);
@@ -1279,6 +1285,7 @@ be_socket_uring_recv_cb_(int result, unsigned cqe_flags, void *arg)
 		bufferevent_add_event_(&bufev->ev_read, &bufev->timeout_read);
 	}
 	mm_free(ctx);
+	event_base_del_virtual_(bufev->ev_base);
 	bufferevent_decref_and_unlock_(bufev);
 }
 
@@ -1295,8 +1302,10 @@ be_socket_uring_submit_recv_multishot_(struct bufferevent *bufev,
 	ctx->bufev = bufev;
 
 	bufferevent_incref_(bufev);
+	event_base_add_virtual_(bufev->ev_base);
 	if (event_io_uring_submit_recv_multishot_(bufev->ev_base, fd,
 	    be_socket_uring_recv_cb_, ctx) < 0) {
+		event_base_del_virtual_(bufev->ev_base);
 		bufferevent_decref_(bufev);
 		mm_free(ctx);
 		return -1;
