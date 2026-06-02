@@ -35,6 +35,7 @@
 
 #include "event2/event-config.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +102,118 @@ bench_ssl_wrap(struct event_base *base, evutil_socket_t fd, int server,
 	    BEV_OPT_CLOSE_ON_FREE | extra_opts);
 }
 #endif /* EVENT__HAVE_OPENSSL */
+
+/* ----------------------------------------------------------------------
+ * Connection-close coverage.
+ *
+ * The streaming throughput loop never closes a connection mid-run, so it
+ * cannot catch teardown/EOF bugs (e.g. an io_uring socket bufferevent whose
+ * in-flight multishot recv blocks the fd from closing on free, hanging the
+ * peer).  This check exercises exactly that: a producer writes one message,
+ * the consumer echoes it, the producer is then freed, and we require the
+ * consumer to observe the close (EOF or error) within a deadline rather than
+ * hang.  It runs for plaintext and TLS, io_uring and syscall.
+ * ---------------------------------------------------------------------- */
+static struct event_base *cc_base;
+static struct bufferevent *cc_prod;
+static int cc_closed; /* 0 = none, 1 = EOF, 2 = error */
+
+static void
+cc_consumer_readcb(struct bufferevent *b, void *arg)
+{
+	char buf[64];
+	int n = bufferevent_read(b, buf, sizeof(buf));
+	if (n > 0)
+		bufferevent_write(b, buf, (size_t)n);
+}
+static void
+cc_consumer_eventcb(struct bufferevent *b, short ev, void *arg)
+{
+	if (ev & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
+		cc_closed = (ev & BEV_EVENT_EOF) ? 1 : 2;
+		event_base_loopexit(cc_base, NULL);
+	}
+}
+static void
+cc_producer_readcb(struct bufferevent *b, void *arg)
+{
+	struct evbuffer *in = bufferevent_get_input(b);
+	evbuffer_drain(in, evbuffer_get_length(in));
+	/* Got the echo: free the producer so its fd closes and the consumer
+	 * must detect the close. */
+	if (cc_prod) {
+		bufferevent_free(cc_prod);
+		cc_prod = NULL;
+	}
+}
+static void
+cc_timeout(evutil_socket_t f, short w, void *arg)
+{
+	event_base_loopexit(cc_base, NULL);
+}
+
+/* Returns 0 if the peer detected the close, 1 if it hung. */
+static int
+bench_close_check(struct event_base *base, int use_ssl, int use_uring)
+{
+	evutil_socket_t sv[2];
+	struct bufferevent *cons = NULL;
+	struct event *to;
+	struct timeval tv = { 5, 0 };
+
+	cc_base = base;
+	cc_prod = NULL;
+	cc_closed = 0;
+	(void)use_uring;
+#ifndef _WIN32
+	/* The consumer may echo into a socket the just-freed producer is
+	 * closing; don't die from SIGPIPE while probing the close path. */
+	signal(SIGPIPE, SIG_IGN);
+#endif
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+		return 1;
+	if (evutil_make_socket_nonblocking(sv[0]) < 0 ||
+	    evutil_make_socket_nonblocking(sv[1]) < 0) {
+		close(sv[0]); close(sv[1]);
+		return 1;
+	}
+#ifdef EVENT__HAVE_OPENSSL
+	if (use_ssl) {
+		int o = use_uring ? BEV_OPT_IO_URING_TLS : 0;
+		cc_prod = bench_ssl_wrap(base, sv[0], 0, o);
+		cons = bench_ssl_wrap(base, sv[1], 1, o);
+	} else
+#endif
+	{
+		cc_prod = bufferevent_socket_new(base, sv[0],
+		    BEV_OPT_CLOSE_ON_FREE);
+		cons = bufferevent_socket_new(base, sv[1],
+		    BEV_OPT_CLOSE_ON_FREE);
+	}
+	if (cc_prod == NULL || cons == NULL) {
+		close(sv[0]); close(sv[1]);
+		return 1;
+	}
+	bufferevent_setcb(cc_prod, cc_producer_readcb, NULL, NULL, NULL);
+	bufferevent_setcb(cons, cc_consumer_readcb, NULL, cc_consumer_eventcb,
+	    NULL);
+	bufferevent_enable(cc_prod, EV_READ | EV_WRITE);
+	bufferevent_enable(cons, EV_READ | EV_WRITE);
+	bufferevent_write(cc_prod, "x", 1);
+
+	to = evtimer_new(base, cc_timeout, NULL);
+	evtimer_add(to, &tv);
+	event_base_dispatch(base);
+	event_free(to);
+
+	printf("close-check: mode=%s%s -> %s\n",
+	    use_uring ? "io_uring" : "syscall", use_ssl ? "+TLS" : "",
+	    cc_closed == 1 ? "CLOSE-DETECTED(EOF)" :
+	    cc_closed == 2 ? "CLOSE-DETECTED(ERROR)" : "HANG-NO-CLOSE");
+	if (cons)
+		bufferevent_free(cons);
+	return cc_closed ? 0 : 1;
+}
 
 struct bench_pair {
 	struct bufferevent *producer;
@@ -171,6 +284,7 @@ usage(const char *prog)
 	    "usage: %s [--uring] [--bytes N] [--rounds R] [--pairs P]\n"
 	    "  --uring           enable EVENT_BASE_FLAG_IO_URING (default off)\n"
 	    "  --ssl             wrap each pair in TLS (bufferevent_openssl_socket_new)\n"
+	    "  --close-check     verify the peer detects connection close (no throughput run)\n"
 	    "  --bytes N         payload bytes per round (default 65536)\n"
 	    "  --rounds R        round trips per pair (default 10000)\n"
 	    "  --pairs P         number of concurrent socket pairs (default 1)\n",
@@ -182,6 +296,7 @@ main(int argc, char **argv)
 {
 	int use_uring = 0;
 	int use_ssl = 0;
+	int close_check = 0;
 	size_t payload_len = 65536;
 	int rounds = 10000;
 	int npairs = 1;
@@ -200,6 +315,8 @@ main(int argc, char **argv)
 			use_uring = 1;
 		} else if (!strcmp(argv[i], "--ssl")) {
 			use_ssl = 1;
+		} else if (!strcmp(argv[i], "--close-check")) {
+			close_check = 1;
 		} else if (!strcmp(argv[i], "--bytes") && i + 1 < argc) {
 			payload_len = (size_t)strtoull(argv[++i], NULL, 0);
 		} else if (!strcmp(argv[i], "--rounds") && i + 1 < argc) {
@@ -244,6 +361,12 @@ main(int argc, char **argv)
 		fprintf(stderr, "bench: built without OpenSSL; --ssl unavailable\n");
 		goto fail;
 #endif
+	}
+
+	if (close_check) {
+		int rc = bench_close_check(base, use_ssl, use_uring);
+		event_base_free(base);
+		return rc;
 	}
 
 	payload = malloc(payload_len);
