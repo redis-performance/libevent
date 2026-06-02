@@ -783,8 +783,27 @@ be_socket_ctrl(struct bufferevent *bev, enum bufferevent_ctrl_op op,
 	case BEV_CTRL_GET_FD:
 		data->fd = event_get_fd(&bev->ev_read);
 		return 0;
+	case BEV_CTRL_CANCEL_ALL: {
+		struct bufferevent_private *bufev_p = BEV_UPCAST(bev);
+		/* An in-flight io_uring multishot recv holds a reference on this
+		 * bufferevent via its completion context.  That reference blocks
+		 * teardown -- and hence the BEV_OPT_CLOSE_ON_FREE fd close in
+		 * be_socket_destruct() -- until the op completes, but a multishot
+		 * waiting on an idle peer never completes on its own.  ev_read is
+		 * kept out of epoll on this path, so the generic finalizer does
+		 * not cancel it either.  bufferevent_free() routes through here
+		 * (bufferevent_cancel_all_), so cancel the multishot now: its
+		 * final (-ECANCELED) CQE then drops the reference, letting the
+		 * bufferevent finalize, close the fd, and deliver EOF to the peer. */
+		if (bufev_p->uring_recv_multishot) {
+			evutil_socket_t fd = event_get_fd(&bev->ev_read);
+			if (fd >= 0)
+				(void)be_socket_uring_cancel_recv_(bev, fd);
+			be_socket_uring_read_timeout_clear_(bev);
+		}
+		return 0;
+	}
 	case BEV_CTRL_GET_UNDERLYING:
-	case BEV_CTRL_CANCEL_ALL:
 	default:
 		return -1;
 	}
